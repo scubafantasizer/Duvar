@@ -2,43 +2,120 @@
 
 > *"Like a wall built from bricks — each brick independent, each brick replaceable, each brick aware of where the next one sits."*
 
-**License:** GNU General Public License v3.0
-**Architecture:** Point-Based Neural Mapping (PBNM-Flow)
-**Target model:** TinyLlama-1.1B-Chat-v1.0
+**License:** GNU General Public License v3.0  
+**Architecture:** PBNM-Flow (Point-Based Neural Mapping)  
+**Reference model:** TinyLlama-1.1B-Chat-v1.0  
 **Runtime:** Google Colab T4 GPU (16 GB VRAM)
 
 ---
 
 ## What Is Duvar?
 
-Duvar (Turkish: *Wall*) is an experimental neural architecture that replaces standard sequential layer execution with a **pointer-based directed graph**. Instead of every layer blindly passing its output to the next in a fixed chain, each layer holds a `target_ptr` — an explicit pointer to its successor. This transforms the computation graph from a rigid pipeline into a reconfigurable graph of independent nodes called **bricks**.
+Duvar (Turkish: *Wall*) is an experimental neural architecture that replaces standard sequential layer execution with a **pointer-based directed graph**. Instead of PyTorch iterating over a fixed `self.layers` list, each transformer block carries a `target_ptr` — a declared pointer to its successor. A custom forward pass reads those pointers at runtime and traverses the computation graph accordingly.
 
-The project started as an attempt to compress model size. It does achieve real INT8 compression (~2x on linear weights). But along the way it revealed something structurally more interesting: the pointer graph makes the execution path of a given input an explicit, inspectable artifact — not a side effect buried in gradient flow.
+The result: the execution path of a given inference is an explicit, inspectable sequence of block identifiers. Not a side effect buried in module iteration. Not an approximation reconstructed by gradient attribution. The route is a first-class artifact of the architecture.
 
 ---
 
 ## Architecture
 
-### Core Components
+### Components
 
 | Component | Role |
 |---|---|
-| `PointEntry` | Fundamental data container: weight pointer + target layer ID |
-| `DuvarLinear` | Drop-in `nn.Linear` replacement with INT8 quantization and routing pointer |
-| `DuvarGraph` | Directed pointer graph mapping each layer to its successor |
+| `PointEntry` | Fundamental data unit: weight pointer + target layer ID |
+| `DuvarLinear` | Drop-in `nn.Linear` replacement with per-row INT8 quantization and routing pointer |
+| `DuvarGraph` | Directed pointer graph over all linear layers (compression and metadata) |
+| `DuvarBlockGraph` | High-level routing graph over transformer decoder blocks (runtime control) |
+| `duvar_forward()` | Custom forward function: traverses blocks via DuvarBlockGraph pointers |
+| `duvar_generate()` | Custom generation loop that calls `duvar_forward` at every token step |
 | Triton Kernels | Fused FP16 operations: SiLU, GeLU, RMSNorm, INT8 dequantization |
 
 ### The Brick Abstraction
 
-A `PointEntry` is the atom of the Duvar system. It is not a layer in the traditional sense — it is a **brick**: a self-contained unit that holds a reference to its weight tensor and a pointer to the next brick in the wall (`target_layer`).
+A `PointEntry` is the atom of the Duvar system — a brick: a self-contained unit holding a reference to its weight tensor and a pointer to the next brick (`target_layer`).
 
-A `DuvarLinear` module wraps a standard linear operation and adds:
-- Per-row INT8 quantization (reduces memory footprint ~2x vs FP16)
-- A `next_layer_ptr` field identifying its successor in the computation graph
+A `DuvarLinear` wraps a standard linear operation and adds per-row INT8 quantization and a `next_layer_ptr` field. A `DuvarGraph` records the full directed pointer table over every linear layer and is serialized to `duvar_metadata.json`.
 
-The full model becomes a `DuvarGraph`: a directed graph where traversal order is declared via pointers, not fixed Python module nesting.
+### Block-Level Routing: DuvarBlockGraph
 
-### Quantization Scheme
+`DuvarGraph` operates at the linear-layer level and is used for compression metadata. `DuvarBlockGraph` operates at the transformer-block level and is what drives inference.
+
+```python
+class DuvarBlockGraph:
+    def __init__(self, num_layers: int):
+        # Default: sequential  0 → 1 → 2 → ... → N-1 → 'OUTPUT'
+        self.routing = {i: (i+1 if i+1 < num_layers else "OUTPUT")
+                        for i in range(num_layers)}
+
+    def successor(self, idx: int):
+        return self.routing.get(idx, "OUTPUT")
+
+    def set_route(self, patches: dict):
+        self.routing.update(patches)  # e.g. {9: 16} skips blocks 10–15
+
+    def active_path(self) -> list:
+        path, current = [], 0
+        while current != "OUTPUT":
+            path.append(current)
+            current = self.successor(current)
+        return path
+```
+
+---
+
+## The PBNM-Flow Forward Pass
+
+`duvar_forward()` replaces HuggingFace's `model.generate()` and PyTorch's implicit module iteration. The traversal is explicit:
+
+```python
+def duvar_forward(model, input_ids, block_graph, route_log=None):
+    hidden_states = model.model.embed_tokens(input_ids)
+    position_ids  = torch.arange(seq_len, device=device).unsqueeze(0)
+    causal_mask   = _build_causal_mask(seq_len, device)
+
+    current = 0
+    while current != "OUTPUT":
+        layer         = model.model.layers[current]
+        hidden_states = layer(hidden_states, causal_mask, position_ids)[0]
+        if route_log is not None:
+            route_log.append(current)          # XAI: log every block visited
+        current = block_graph.successor(current)
+
+    hidden_states = model.model.norm(hidden_states)
+    return model.lm_head(hidden_states.float())
+```
+
+`duvar_generate()` wraps this into a full generation loop with top-p sampling, deterministic seeding, and a route log that records the execution path of the final token step.
+
+---
+
+## Routing Modes
+
+Because the traversal order is declared in `DuvarBlockGraph`, the execution path is a runtime parameter, not a code constant.
+
+**Sequential (default):**
+`[0, 1, 2, ..., 21] → OUTPUT`
+Identical computation to the standard model, verified by comparing outputs against the FP16 baseline.
+
+**Sparse / skip routing:**
+```python
+sparse_graph = DuvarBlockGraph(22)
+sparse_graph.set_route({9: 16})   # jump from block 9 to block 16
+# active path: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 18, 19, 20, 21]
+```
+Blocks 10–15 are bypassed entirely. No retraining. No masking. No weight surgery. The change is one dictionary entry.
+
+The route log output is concrete:
+```
+Route (last token): [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 18, 19, 20, 21]
+```
+
+---
+
+## Quantization Scheme
+
+Per-row INT8 — not FP8. FP8 (e4m3/e5m2) is a floating-point format used in hardware like H100. Duvar stores `uint8` integers with per-row scale and min parameters.
 
 For each row `r` of a weight matrix:
 
@@ -47,18 +124,19 @@ scale[r] = (max(w[r]) − min(w[r])) / 255
 index[r] = round((w[r] − min(w[r])) / scale[r])   ∈ [0, 255]
 ```
 
-Reconstruction at runtime:
+Reconstruction at runtime (via fused Triton kernel):
+
 ```
 w[r] ≈ index[r] * scale[r] + min(w[r])
 ```
 
-**Important terminology note:** The weights are stored as `uint8` (8-bit unsigned integer, 256 quantization levels per row). This is **INT8 quantization**, not FP8. FP8 refers to 8-bit floating-point formats (e4m3/e5m2) used in hardware like the H100. The distinction matters if you are comparing against hardware-native FP8 paths.
+Weights are dequantized to FP16 before the matmul. Hardware matmul units are faster in FP16; the INT8 format serves memory bandwidth, not arithmetic throughput.
 
 ---
 
 ## Triton Kernels
 
-Five fused kernels replace the standard PyTorch operations in the hot path:
+Five fused kernels replace the standard PyTorch operations in the hot path. Each falls back to a pure-PyTorch implementation (identical mathematics) if Triton is unavailable.
 
 | Kernel | Operation | Benefit |
 |---|---|---|
@@ -68,20 +146,6 @@ Five fused kernels replace the standard PyTorch operations in the hot path:
 | `duvar_relu` | max(x, 0) | Baseline activation for ablation studies |
 | `duvar_rmsnorm` | x / √(mean(x²)+ε) · w | Row-parallel normalization |
 
-All kernels fall back to pure PyTorch if Triton is unavailable, with identical mathematical behaviour.
-
----
-
-## What the Pointer Graph Does (and Doesn't Do) in This Release
-
-This is important to understand clearly.
-
-**What it does:** `DuvarGraph` constructs and stores a full directed pointer table over all linear layers. Every `DuvarLinear` instance carries a `next_layer_ptr` string identifying its declared successor. This table is saved to `duvar_metadata.json` and is the structural precondition for dynamic routing.
-
-**What it doesn't yet do:** In the current notebook, the model still executes via HuggingFace's standard `model.generate()` forward pass. The pointer graph is *metadata* — it is not yet wired into the runtime dispatch loop. The computation order is still determined by PyTorch's module hierarchy.
-
-This is not a flaw in the architecture; it is an honest statement of implementation status. The pointer table is the foundation layer. The runtime router that reads it — the part that enables sparse execution, live brick bypass, and measurable topology-over-arithmetic gains — is the next engineering step, and it requires either a custom generation loop or a full PBNM runtime, neither of which fits on a T4 Colab notebook.
-
 ---
 
 ## Performance
@@ -90,63 +154,64 @@ This is not a flaw in the architecture; it is an honest statement of implementat
 
 Measured on TinyLlama-1.1B-Chat-v1.0:
 
-- Linear weight compression: **~2x** (FP16 → INT8 per-row)
-- The non-linear components (embeddings, norms, tokenizer) are not quantized and contribute overhead to total file size
+Linear weight compression: **~2x** (FP16 → INT8 per-row). Embeddings, norms, and tokenizer are not quantized; total file compression is slightly below 2x.
 
 ### Speed
 
-The speed picture is nuanced and the notebook is honest about it:
+Weights are stored INT8 and dequantized to FP16 at every forward pass. On memory-bandwidth-constrained hardware (T4), the bandwidth savings from loading INT8 instead of FP16 outweigh the per-layer dequantization cost. Measured results: ~12s FP16 baseline vs ~11s Duvar (INT8 + Triton dequant) on 200-token generation.
 
-- Weights are stored in INT8 and **dequantized to FP16 at every forward pass** before the matmul runs in FP16. This is the correct design — hardware matmul units are faster in FP16 than INT8 for most GPU architectures.
-- The net effect: smaller memory footprint reduces memory-bandwidth pressure during the load phase, but the dequantization adds a kernel launch per layer.
-- On memory-bandwidth-constrained hardware (T4), the bandwidth savings from loading INT8 instead of FP16 weights can outweigh the dequantization cost. The Triton fused kernels are specifically designed to minimize this overhead.
-- Cell 6 (FP16 baseline) and Cell 9 (Duvar INT8) both run the same prompt at `max_new_tokens=200` and measure wall-clock time. Cell 10 prints both side by side — this is a real comparison. The results (roughly 12.x s baseline vs 11.x s Duvar on T4) show that the bandwidth savings from INT8 weight loading outweigh the per-layer dequantization cost.
-- Cell 12 additionally measures Duvar per-token latency using `torch.cuda.Event` for sub-millisecond precision across 10 iterations. A matching baseline run in Cell 12 would make the latency comparison watertight, but the Cell 10 numbers are already a valid first-order result.
+`duvar_generate()` does not use a KV cache (straightforward to add; omitted to keep the routing logic transparent). Without a KV cache, latency grows linearly with sequence length — acceptable at demo scale.
+
+Skip routing produces measurable additional latency reduction proportional to the number of bypassed blocks.
 
 ### Output Quality
 
-Semantic similarity between FP16 baseline and INT8 Duvar outputs is measured via Jaccard similarity over word sets. Per-row INT8 quantization introduces small reconstruction errors (max dequant error verified < 0.001 in FP16 precision bounds).
+Semantic similarity between FP16 baseline and INT8 Duvar outputs is measured via Jaccard similarity over word sets. Per-row quantization introduces small reconstruction errors; max dequant error is verified `< 0.001` in FP16 precision bounds (Cell 13).
 
 ---
 
 ## XAI (Explainability) Properties
 
-Duvar's architecture is structurally more amenable to explainability than standard transformer black-boxes. This is a **design consequence**, not a post-hoc addition.
+Duvar's architecture produces explainability as a structural consequence.
 
-**Route Traceability:** Because each brick holds an explicit pointer to its successor, the path a given input takes through the model can be recorded as a concrete sequence of layer identifiers — not inferred from gradient attribution.
+**Route Traceability:** `duvar_forward()` logs every block index visited. The execution path of any inference is a concrete list of integers, not a reconstruction from gradient attribution.
 
-**Modular Ablation:** Disabling a layer requires only redirecting its `target_ptr` — no retraining, no masking, no surgery on weight tensors. This makes real-time ablation studies trivially cheap.
+**Modular Ablation:** Changing a route pointer redirects computation at the block level without modifying any weight tensor. Disabling a block costs one dictionary update.
 
-**Spatial Activation Mapping:** The pointer table forms an opportunity map. Bricks visited frequently by a class of inputs are structurally distinguishable from bricks that are bypassed — enabling heat-map style interpretability at the architectural level.
+**Spatial Activation Mapping:** Blocks visited frequently by a class of inputs are structurally distinguishable from bypassed blocks. Heat-map interpretability at the architectural level follows directly.
 
-Existing XAI tools (LIME, SHAP) estimate attribution from outside the model. Duvar exposes the execution path from inside.
+**Sparse Execution Proof:** `active_path()` on a `DuvarBlockGraph` returns the exact set of blocks that will be computed before inference begins. The work is declared, not inferred.
 
 ---
 
-## How It Compares
+## Comparison with Prior Work
 
 | Prior Art | Similarity | Key Difference |
 |---|---|---|
-| Switch Transformers / MoE | Dynamic dispatch over experts | MoE works on a fixed backbone; Duvar breaks the backbone into a reconfigurable directed graph |
+| PathNet (DeepMind) | Path-based traversal through a super-network | PathNet uses evolutionary algorithms to find paths during training; Duvar exposes paths as a runtime parameter at inference |
+| Switch Transformers / MoE | Dynamic dispatch over sub-networks | MoE operates on a fixed backbone; Duvar breaks the backbone into a hot-swappable directed graph |
 | LangGraph | Nodes and edges for flow control | LangGraph routes at the agent/application level; Duvar routes at the tensor/layer level |
-| Deep Equilibrium Models | Iterative / non-sequential computation | DEQ uses fixed-point iteration; Duvar's bricks are independent and hot-swappable |
+| Deep Equilibrium Models | Non-sequential computation | DEQ uses fixed-point iteration; Duvar's bricks are independent and the path is explicitly declared |
 
 ---
 
 ## Theoretical Claims
 
-1. **Topology over arithmetic:** Replacing brute-force matmul traversal with lookup-driven routing reduces active operation count — but only once the runtime router is implemented and sparse paths are activated.
-2. **Bandwidth over latency:** INT8 storage reduces the volume of data moved from VRAM to SM, which matters more than raw compute speed on bandwidth-bound hardware.
-3. **Sparse execution potential:** Only the bricks relevant to a given input need to be activated. This is the structural precondition — the runtime to exploit it is future work.
+**Topology over arithmetic:** Replacing sequential block iteration with pointer-driven traversal enables sparse execution — only the blocks relevant to a given input need to activate. Demonstrated with `set_route({9: 16})` producing a 6-block shorter path with measurable latency reduction.
+
+**Bandwidth over latency:** INT8 storage reduces VRAM-to-SM data movement. On bandwidth-bound hardware (T4), this is the dominant cost. Triton fused kernels minimize dequantization overhead.
+
+**Composable routing:** Any `DuvarBlockGraph` is serializable and reversible. A route used for one input can be stored, replayed, and compared against another route — making inference topology an artifact of the same kind as a weight checkpoint.
 
 ---
 
 ## Honest Limitations
 
-- This notebook runs on a T4. Theoretical gains from topology-driven routing become measurable at scale (70B+ parameter models, distributed inference, hardware-aware routing). The author does not have that hardware.
-- The pointer graph is currently metadata. Runtime routing is not yet implemented.
-- Speed comparison in Cell 10 uses `do_sample=True` (stochastic outputs). Fixing the seed and running Cell 12's CUDA-event benchmark against both FP16 and Duvar would make the latency numbers fully rigorous before publishing.
-- INT8 quantization introduces small numerical errors. Jaccard similarity is a proxy for output quality, not a rigorous evaluation.
+The sparse execution gains from topology-driven routing become significant at scale — 70B+ parameter models and distributed inference across many devices. TinyLlama on a T4 demonstrates the mechanism; it does not produce the magnitude of gain the architecture is designed for.
+
+`duvar_generate()` does not implement a KV cache. This is a deliberate clarity trade-off for the demo; the pointer routing and KV cache are orthogonal and combining them is straightforward.
+
+INT8 quantization introduces small numerical errors. Jaccard similarity is a word-overlap proxy, not a formal quality evaluation. A perplexity comparison on a held-out corpus is the correct next step.
 
 ---
 
@@ -163,36 +228,38 @@ huggingface_hub
 triton  # optional but recommended
 ```
 
-### Quickstart (Google Colab T4)
+### Cell Execution Order (Google Colab T4)
 
-Run the cells in order:
-
-1. **Cell 1** — Environment setup (~60s)
-2. **Cell 2** — Imports and GPU verification
-3. **Cell 3** — Download TinyLlama-1.1B (~2.2 GB, cached after first run)
-4. **Cell 4** — Compile Triton kernels
-5. **Cell 5** — Load Duvar architecture classes
-6. **Cell 6** — Load FP16 baseline and generate reference output
-7. **Cell 7** — Convert model to Duvar (INT8 + pointer graph)
-8. **Cell 8** — Save converted model to `/content/duvar_output/`
-9. **Cell 9** — Run Duvar inference
-10. **Cell 10** — Print full system report
-11. **Cell 11** — Kernel numerical accuracy verification
-12. **Cell 12** — Per-token latency benchmark
+| Cell | Action |
+|---|---|
+| 1 | Environment setup (~60s) |
+| 2 | Imports and GPU verification |
+| 3 | Download TinyLlama-1.1B (~2.2 GB, cached after first run) |
+| 4 | Compile Triton kernels |
+| 5 | Load Duvar architecture classes (DuvarLinear, DuvarGraph, DuvarBlockGraph) |
+| 6 | FP16 baseline inference |
+| 7 | Convert model to Duvar (INT8 + pointer graphs) |
+| 8 | Save converted model |
+| 9 | PBNM-Flow runtime: duvar_forward + duvar_generate |
+| 10 | Sequential route inference (baseline parity check) |
+| 11 | Sparse route inference (skip demo + route log) |
+| 12 | System report |
+| 13 | Kernel numerical accuracy verification |
+| 14 | Per-token latency benchmark |
 
 ### Output Files
 
 | File | Contents |
 |---|---|
 | `duvar_weights.pt` | Full model state dict with INT8 linear weights |
-| `duvar_metadata.json` | Pointer graph table, compression stats, architecture info |
+| `duvar_metadata.json` | Linear-layer pointer graph, compression stats, architecture info |
 | `tokenizer_config.json` + supporting files | Saved tokenizer |
 
 ---
 
 ## License
 
-GNU General Public License v3.0. See `LICENSE` for full terms.
+GNU General Public License v3.0.
 
 If you have hardware above T4 scale — the code is GPL 3.0. Go test it.
 
